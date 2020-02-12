@@ -1,0 +1,189 @@
+---
+title: "NK cell IL-33 single cell experiment pre-processing"
+author: "Arianne Richard"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+First, load the appropriate packages and introduce the functions.
+
+```{r}
+library(scran)
+library(scater)
+library(DropletUtils)
+library(SingleCellExperiment)
+source('NKcell_plotting_functions.R')
+
+```
+
+## Read in the data
+
+Let's read in all of the matrix files and see how they look.  We'll read in the raw data and then run emptyDrops ourselves in order to be able to check for swapped barcodes.
+
+```{r}
+samps <- c('SIGAC9', 'SIGAD9', 'SIGAE9', 'SIGAF9')
+mats <- vector('list', length=length(samps))
+names(mats) <- samps
+
+for(i in 1:length(samps)){
+  mats[[i]] <- read10xCounts(paste0('raw_data/', samps[i], '/outs/raw_feature_bc_matrix'))
+}
+
+lapply(mats, dim)
+
+```
+
+And we'll annotate the mitochondrial genes for later use in QC.
+
+```{r}
+
+library(org.Mm.eg.db)
+x <- org.Mm.egCHR
+mapped_genes <- mappedkeys(x)
+xx <- as.list(x[mapped_genes])
+xx <- lapply(xx, function(x){x[1]})
+
+x <- org.Mm.egENSEMBL 
+mapped_genes <- mappedkeys(x)
+xy <- as.list(x[mapped_genes])
+xy <- xy[!is.na(xy)]
+used <- xy[which(xy %in% rowData(mats[[1]])$ID)]
+df <- data.frame(EntrezID=names(used), EnsemblID=unlist(used))
+df$chr <- xx[rownames(df)]
+df <- df[-(which(duplicated(df$EnsemblID))),]
+rownames(df) <- df$EnsemblID
+df$chr <- as.character(df$chr)
+
+for(i in 1:length(mats)){
+  location <- df[rownames(rowData(mats[[i]])), 'chr']
+  rowData(mats[[i]])$CHR <- location
+  print(summary(location=="MT"))
+}
+
+```
+
+## QC
+
+Let's perform some quality control steps on the data.
+
+### Swapped barcodes
+
+First we want to look for swapped barcodes and remove these reads. We use the raw unfiltered dataset as we may have swapping between cellular and empty drops and want to see this.
+
+```{r}
+files <- paste0('raw_data', samps, '/outs/molecule_info.h5')
+
+swapping <- swappedDrops(files, get.swapped=TRUE, get.diagnostics=TRUE, min.frac=0.9)
+
+for(i in 1:length(swapping$swapped)){
+  print(sum(swapping$swapped[[i]])/(sum(swapping$cleaned[[i]])+sum(swapping$swapped[[i]])))
+}
+
+```
+
+So swapping appears to be taking place approximately 5% of the time. This isn't great!  
+
+Let's get rid of the swapped reads by replacing raw data values with cleaned values.
+
+To do this, we need to replace the appropriate columns of the counts matrix with the same columns of the cleaned matrix. But first we must check that the additional columns in the counts matrix are all empty.
+
+```{r}
+
+for(i in 1:length(mats)){
+  replacement <- counts(mats[[i]])
+  colnames(replacement) <- mats[[i]]$Barcode
+  bcs <- paste0(colnames(swapping$cleaned[[i]]), '-1')
+  cleaned <- swapping$cleaned[[i]]
+  colnames(cleaned) <- bcs
+  print(table(colSums(replacement[,!colnames(replacement) %in% colnames(cleaned)])))
+  replacement[,colnames(cleaned)] <- cleaned[,colnames(cleaned)]
+  colnames(replacement) <- NULL
+  counts(mats[[i]]) <- replacement
+}
+
+```
+
+Yes, all of the cell barcodes that weren't in the molecule information file were in fact empty.
+
+Now we should have a cleaned matrix.
+
+### Empty droplets
+
+Now, we'll look for empty droplets. We'll do this on a per-sample basis as the background ambient RNA might differ by 10x lane. We include some QC checks in the run to see if we have run enough iterations and if droplets with fewer than 100 UMIs are in fact empty.
+
+```{r}
+
+brs <- lapply(mats, function(x) {
+  temp <- counts(x)
+  return(barcodeRanks(temp))})
+
+for(i in 1:length(brs)){
+  # returning only unique for plotting speed
+  uniq <- !duplicated(brs[[i]]$rank)
+  plot(brs[[i]]$rank[uniq], brs[[i]]$total[uniq], log="xy",
+       xlab="Rank", ylab="Total UMI count", cex.lab=1.2)
+  abline(h=metadata(brs[[i]])$inflection, col="darkgreen", lty=2)
+  abline(h=metadata(brs[[i]])$knee, col="dodgerblue", lty=2)
+  legend("bottomleft", legend=c("Inflection", "Knee"), 
+         col=c("darkgreen", "dodgerblue"), lty=2, cex=1.2)
+}
+
+mats_filt_2 <- lapply(mats, function(x){
+  set.seed(100)
+  e.out <- emptyDrops(counts(x))
+  # checking the fit
+  print(table(Sig=e.out$FDR <= 0.01, Limited=e.out$Limited))
+  print(sum(e.out$FDR <= 0.001, na.rm=TRUE))
+  # using which() to automatically remove NAs.
+  x <- x[,which(e.out$FDR <= 0.001)]
+  return(x)
+})
+
+## check the model:
+for(i in 1:length(mats)){
+  limit=100
+  all.out <- emptyDrops(counts(mats[[i]]), lower=limit, test.ambient=TRUE)
+  hist(all.out$PValue[all.out$Total <= limit & all.out$Total > 0],
+    xlab="P-value", main="", col="grey80")
+}
+
+```
+
+And let's look at the plots from the data filtered with emptyDrops.
+
+```{r}
+
+brs <- lapply(mats_filt_2, function(x) {
+  temp <- counts(x)
+  return(barcodeRanks(temp))})
+
+for(i in 1:length(brs)){
+  # returning only unique for plotting speed
+  uniq <- !duplicated(brs[[i]]$rank)
+  plot(brs[[i]]$rank[uniq], brs[[i]]$total[uniq], log="xy",
+       xlab="Rank", ylab="Total UMI count", cex.lab=1.2)
+  abline(h=metadata(brs[[i]])$inflection, col="darkgreen", lty=2)
+  abline(h=metadata(brs[[i]])$knee, col="dodgerblue", lty=2)
+  legend("bottomleft", legend=c("Inflection", "Knee"), 
+         col=c("darkgreen", "dodgerblue"), lty=2, cex=1.2)
+}
+
+```
+
+Let's save everything we have so we can come back to it later.
+
+```{r}
+saveRDS(mats_filt_2, file='data/filtered_matrices.rds')
+rm(all.out, bcs, brs, cleaned, df, i, limit, location, replacement, swapping, uniq, used)
+save(list=ls(), file='data/filtered_matrices.RData')
+```
+
+And we'll save the session information to be thorough.
+
+```{r}
+sessionInfo()
+```

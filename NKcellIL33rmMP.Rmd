@@ -1,0 +1,139 @@
+---
+title: "NK cell IL-33 single cell experiment removing macrophages"
+author: "Arianne Richard"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Read in the data
+
+Read in dataset that has been QC-filtered and add in treatment information.
+
+```{r}
+library(scran)
+library(scater)
+library(DropletUtils)
+library(SingleCellExperiment)
+library(edgeR)
+
+mat <- readRDS('data/NK_cells_QCfilt.rds')
+
+treatment <- mat$Sample
+treatment [treatment %in% c('SIGAC9', 'SIGAD9')] <- 'PBS'
+treatment [treatment %in% c('SIGAE9', 'SIGAF9')] <- 'IL33'
+treatment <- factor(treatment, levels=c('PBS', 'IL33'))
+mat$treatment <- treatment
+
+```
+
+# Macrophage fitering
+
+Based on some exploratory analyses, we suspect there is contamination of a very small number of macrophages. We want to filter these out. To do this, we'll use a list of genes that have been chosen based on their expression in alveolar macrophages and alternatively activated macrophages.
+
+To be sure that it's not actually NK cells expressing these genes, we'll also look at expression canonical NK cells genes.
+
+Gene lists came from the following:
+1) Immgen - population comparison of splenic NK cell populations versus lung alveolar macrophages ('http://rstats.immgen.org/PopulationComparison/index_rnaseq.html')
+Selecting genes that are always expressed in one population and never in the other. Genes were then ordered by highest to lowest expression in the population of interest and the top 10 taken forward.
+
+2) NK cell signature gene list supplied by Halim lab, from https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6269138/ (many genes overlap with those in the Immgen list)
+
+3) Alternatively activated macrophage marker genes from https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4782595/ and alveolar macrophage marker genes from https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3824047/
+
+First we select cells that may be macrophages based on expressing at least 1 macrophage marker gene.
+
+```{r}
+list_gene <- function(gene_symbol){
+  if(!gene_symbol %in% rowData(mat)$Symbol){
+    print(paste0(gene_symbol, ' is not expressed'))
+    return(NA)
+  } else {
+    return(exprs(mat)[rownames(mat)[rowData(mat)$Symbol == gene_symbol],])
+  }
+}
+
+macrophage_genes <- c('Chil4', 'Mmp12', 'Arg1', 'Retnla', 'Alox12e', 'Chil3', 'Lyz2', 'Ear2', 'Mrc1', 'Plet1', 'Lpl', 'Cybb', 'Clec7a', 'Tgfbi', 'Atp6v0d2', 'Siglecf', 'Fcgr1a', 'Sirpa')
+
+macrophage_list <- as.list(macrophage_genes)
+macrophage_list <- lapply(macrophage_list, list_gene)
+names(macrophage_list) <- macrophage_genes
+macrophage_list <- macrophage_list[!is.na(macrophage_list)]
+
+stripchart(macrophage_list, pch=1, vertical=TRUE, method='jitter', jitter = 0.2, las=3)
+
+```
+
+We'll take all cells in which we detected at least one copy of at least one of these genes forward.
+
+```{r}
+mac_genes <- names(macrophage_list)
+mac_genen <- rownames(mat)[rowData(mat)$Symbol %in% mac_genes]
+
+mat_mac <- mat[,apply(counts(mat[mac_genen,]), 2, sum) > 0]
+
+```
+
+Now we also pull out all of the NK cell signature genes and plot all potential macrophages looking at both NK cell and macrophage signature genes.
+
+```{r}
+
+nk_genes <- c('Gzma', 'Ccl5', 'Nkg7', 'Klrk1', 'Ncr1', 'Prf1', 'Klrb1c', 'Il2rb', 'Klra13-ps', 'Klra4', 'Eomes', 'Il18rap', 'Khdc1a', 'Klrb1a', 'Klre1', 'Klrg1', 'S1pr5')
+nk_genen <- rownames(mat)[rowData(mat)$Symbol %in% nk_genes]
+
+mat_mac <- mat_mac[c(mac_genen, nk_genen),]
+rownames(mat_mac) <- rowData(mat_mac)[rownames(mat_mac), 'Symbol']
+
+col_col <- data.frame(treatment=factor(mat_mac$treatment, levels=c('PBS', 'IL33')))
+mat_mac <- as.matrix(exprs(mat_mac))
+colnames(mat_mac) <- rownames(col_col)
+
+library(pheatmap)
+
+pheatmap(mat_mac, annotation_col=col_col, show_colnames=FALSE, cluster_rows=FALSE)
+
+
+```
+
+So it appears that in general the cells that express at least 3 macrophage genes are not NK cells.
+
+We'll make a classifier for these cells: if they express more macrophage genes than NK cells genes, we'll label them as macrophages. We'll re-plot to make sure it looks OK.
+
+```{r}
+macrophage_evidence <- unlist(apply(counts(mat[mac_genen,]), 2, function(x){length(which(x>0))}))
+NK_evidence <- unlist(apply(counts(mat[nk_genen,]), 2, function(x){length(which(x>0))}))
+mat$macrophage <- macrophage_evidence > NK_evidence
+
+table(mat$macrophage)
+
+mat_mac <- mat[,apply(counts(mat[mac_genen,]), 2, sum) > 0]
+mat_mac <- mat_mac[c(mac_genen, nk_genen),]
+rownames(mat_mac) <- rowData(mat_mac)[rownames(mat_mac), 'Symbol']
+
+col_col <- data.frame(macrophage=factor(mat_mac$macrophage))
+mat_mac <- as.matrix(exprs(mat_mac))
+colnames(mat_mac) <- rownames(col_col)
+
+library(pheatmap)
+
+pheatmap(mat_mac, annotation_col=col_col, show_colnames=FALSE, cluster_rows=FALSE)
+
+
+```
+
+This looks pretty good. We will filter out these few macrophages and save the data.
+
+```{r}
+mat <- mat[,!mat$macrophage]
+saveRDS(mat, file='data/NK_cells_QCfilt_MPfilt.rds')
+```
+
+And finally we'll save the session information.
+
+```{r}
+sessionInfo()
+```
+

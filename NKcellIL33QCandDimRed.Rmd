@@ -1,0 +1,429 @@
+---
+title: "NK cell IL-33 single cell experiment QC and dimensionality reduction"
+author: "Arianne Richard"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: html_document
+---
+
+This analysis will perform QC filtering on the single-cell NK cell data, removing mitochondrial outliers, performing clustering and dimensionality reduction.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+First, load the appropriate packages and introduce the functions.
+
+```{r}
+library(scran)
+library(scater)
+library(DropletUtils)
+library(SingleCellExperiment)
+source('NKcell_plotting_functions.R')
+
+```
+
+## Read in the data
+
+Load the data 
+
+```{r}
+load(file='data/filtered_matrices.RData')
+```
+
+## Cell level QC
+
+Now let's do some cell-level QC. We'll combine all of the cells into a single merged experimental object for this, add feature annotation and look at the number of counts, genes, and mitochondrial gene ratio for each cell. 
+
+```{r}
+
+mat <- do.call('cbind', mats_filt_2)
+
+```
+
+Let's first look at the number of total counts. 
+
+```{r}
+
+mat$Sample <- unlist(lapply(strsplit(mat$Sample, '/'), function(y){
+  y[8]
+}))
+
+mat <- calculateQCMetrics(mat, feature_controls=list(Mito=which(rowData(mat)$CHR=="MT")), use_spikes=FALSE)
+hist(mat$log10_total_counts, breaks=50)
+
+```
+
+This definitely has some trailing off. But it could be different cell types, so we'll go with it for now.
+
+Look at the number of genes detected per cell.
+
+```{r}
+
+hist(mat$total_features_by_counts, breaks=50)
+
+```
+
+Similarly awkward.
+
+Look at the ratio of mitochondrial to chromosomal reads per cell.
+
+```{r}
+mat$log10_mito_ratio <- mat$log10_total_counts_Mito - mat$log10_total_counts_endogenous
+hist(mat$log10_mito_ratio, breaks=50)
+```
+
+Let's look at this per sample in case there's an effect of one or more of the treatments.
+
+```{r}
+
+samps <- levels(factor(mat$Sample))
+
+for(i in 1:length(samps)){
+  temp <- colData(mat)[mat$Sample %in% samps[i],]
+  hist(temp$log10_mito_ratio, 
+       breaks=50, main=samps[i], xlab="log10(mito counts / nuclear counts)")
+  print(median(temp$log10_mito_ratio))
+}
+
+
+```
+
+There are some subtle shifts with each sample, but it's really minimal. 
+
+It looks like we ought to filter on all of these criteria: number of UMIs, number of genes detected and mitochondrial gene ratio - we can do it all together.
+
+We'll also save the data with outliers simply marked instead of removed in case we need that later.
+
+```{r}
+UMIfilt <- isOutlier(mat$log10_total_counts, nmads=3, type='lower')
+genefilt <- isOutlier(mat$total_features_by_counts, nmads=3, type='lower')
+mitofilt <- isOutlier(mat$log10_mito_ratio, nmads=3, type='both')
+
+mat$UMIoutlier <- UMIfilt
+mat$geneoutlier <- genefilt
+mat$mitooutlier <- mitofilt
+
+saveRDS(mat, file='data/NK_cells_QCmarked.rds')
+
+table(UMIfilt, genefilt, mitofilt)
+mat <- mat[,!(mitofilt | UMIfilt | genefilt)]
+hist(mat$log10_total_counts, breaks=50)
+hist(mat$total_features_by_counts, breaks=50)
+hist(mat$log10_mito_ratio, breaks=50)
+dim(mat)
+
+```
+
+## Normalization
+
+Now let's normalize the data.  We'll use scran's sum factors with pre-clustering. 
+
+```{r}
+
+library(BiocSingular)
+set.seed(1000)
+clusters <- quickCluster(mat, use.ranks=FALSE, BSPARAM=IrlbaParam())
+table(clusters, mat$Sample)
+
+mat <- computeSumFactors(mat, min.mean=0.1, cluster=clusters)
+summary(sizeFactors(mat))
+plot(mat$total_counts, sizeFactors(mat), log="xy")
+
+
+hist(sizeFactors(mat), breaks=50)
+plot(mat$log10_total_counts, sizeFactors(mat), log="y")
+plot(mat$log10_total_counts, sizeFactors(mat), log="y", 
+     col=c('lightskyblue1', 'royalblue4', 'coral', 'red4')[as.numeric(factor(mat$Sample))])
+plot(mat$log10_total_counts_endogenous, sizeFactors(mat), log="y", 
+     col=c('lightskyblue1', 'royalblue4', 'coral', 'red4')[as.numeric(factor(mat$Sample))])
+plot(mat$log10_total_counts_Mito, sizeFactors(mat), log="y", 
+     col=c('lightskyblue1', 'royalblue4', 'coral', 'red4')[as.numeric(factor(mat$Sample))])
+
+
+library(viridis)
+cols_mt <- viridis(300)[cut(mat$log10_mito_ratio, breaks=300)]
+plot(mat$log10_total_counts, sizeFactors(mat), log="xy", col=cols_mt)
+
+rm(cols_mt)
+
+mat <- normalize(mat)
+
+```
+
+There is not much association between the sample designation and the relationship between the size factor and the total counts. There does appear to still be a higher proportion of mitochondrial reads in cells with the lowest total counts, but this is just the tail end of the pretty normal-looking histogram above. 
+
+## Cell cycle
+
+We'll use the Seurat implementation of cell cycle designation for the sake of speed. First we have to turn our data into a Seurat object. 
+
+```{r}
+library(Seurat)
+
+## make Seurat object
+cts <- counts(mat)
+exprsdat <- exprs(mat)
+colnames(cts) <- paste0('cell', as.character(c(1:ncol(cts))))
+colnames(exprsdat) <- paste0('cell', as.character(c(1:ncol(exprsdat))))
+Smat <- CreateSeuratObject(counts = cts)
+Smat@assays$RNA@data <- exprsdat
+```
+
+Seurat provides lists of genes associated with s and g2m phases, but we need to convert these from human gene symbols to mouse orthologs. Let's do that using biomart.
+
+```{r}
+library(biomaRt)
+mart.h = useMart("ensembl", dataset="hsapiens_gene_ensembl")
+mart.m = useMart("ensembl", dataset="mmusculus_gene_ensembl") 
+
+s.genes.mouse <- getLDS(attributes =c("hgnc_symbol"),
+                        filters = "hgnc_symbol", values = cc.genes.updated.2019$s.genes, mart = mart.h,
+                        attributesL = c("ensembl_gene_id"), martL = mart.m)
+
+g2m.genes.mouse <- getLDS(attributes =c("hgnc_symbol"),
+                        filters = "hgnc_symbol", values = cc.genes.updated.2019$g2m.genes, mart = mart.h,
+                        attributesL = c("ensembl_gene_id"), martL = mart.m)
+```
+
+And now we can run cell cycle analysis.
+
+```{r}
+
+Smat <- CellCycleScoring(object = Smat, s.features = s.genes.mouse$Gene.stable.ID, g2m.features = g2m.genes.mouse$Gene.stable.ID, set.ident = TRUE)
+
+# view cell cycle scores and phase assignments
+head(Smat@meta.data$S.Score)
+head(Smat@meta.data$G2M.Score)
+table(Smat@meta.data$Phase)
+
+plot(Smat@meta.data$S.Score, Smat@meta.data$G2M.Score, col=c('blue', 'red', 'gold')[as.numeric(factor(Smat@meta.data$Phase))])
+
+mat$Seurat_Phase <- Smat@meta.data$Phase
+mat$Seurat_Sscore <- Smat@meta.data$S.Score
+mat$Seurat_G2Mscore <- Smat@meta.data$G2M.Score
+
+rm(list=c("Smat", "g2m.genes.mouse", "s.genes.mouse"))
+
+```
+
+I'm not convinced of the hard thresholds for phases here, but the scores can be informative.  We'll plot them later.
+
+## Dimensionality reductions
+
+For dimensionality reductions, we'll look at highly variable genes first. 
+
+```{r}
+
+new.trend <- makeTechTrend(x=mat)
+
+fit <- trendVar(mat, use.spikes=FALSE, loess.args=list(span=0.05))
+plot(fit$mean, fit$var)
+curve(fit$trend(x), col='dodgerblue', lwd=2, add=TRUE)
+curve(new.trend(x), col="red", add=TRUE)
+
+fit0 <- fit
+fit$trend <- new.trend
+dec <- decomposeVar(fit=fit) # use per-gene variance estimates in 'fit'.
+top.dec <- dec[order(dec$bio, decreasing=TRUE),] 
+head(top.dec)
+
+plot(dec$mean, dec$bio)
+
+rm("fit", "fit0")
+
+```
+
+Now we'll "de-noise" (select top biologically relevant PCs) and then visualize as a PCA and tSNE.
+
+```{r}
+
+set.seed(1000)
+mat <- denoisePCA(mat, technical=new.trend, BSPARAM=IrlbaParam())
+ncol(reducedDim(mat, "PCA"))
+
+plot(attr(reducedDim(mat), "percentVar"), xlab="PC",
+    ylab="Proportion of variance explained")
+abline(v=ncol(reducedDim(mat, "PCA")), lty=2, col="red")
+```
+
+So PCs 1-4 are most impressive. However, we'll keep the 67 PCs recommended in case there are subtle effects that come out with the tSNE.
+
+Let's see how the PCA and other dimensionality reduction plots look, colored by sample (blues are PBS, reds are IL33).
+
+```{r}
+plot_2D_generic(reducedDim(mat,"PCA")[,1], reducedDim(mat,"PCA")[,2], 
+                cols=c('lightskyblue1', 'royalblue4', 'coral', 'red4'),
+                cols_fac=factor(mat$Sample),
+                xlab=paste0('PC1 ', 100*round(attr(reducedDim(mat), "percentVar")[1], 4), '%'),
+                ylab=paste0('PC2 ', 100*round(attr(reducedDim(mat), "percentVar")[2], 4), '%'))
+
+set.seed(100)
+mat <- runTSNE(mat, use_dimred="PCA")
+
+plot_2D_generic(reducedDim(mat,"TSNE")[,1], reducedDim(mat,"TSNE")[,2], 
+                cols=c('lightskyblue1', 'royalblue4', 'coral', 'red4'),
+                cols_fac=factor(mat$Sample),
+                xlab='TSNE 1',
+                ylab='TSNE 2')
+
+set.seed(100)
+mat <- runUMAP(object=mat, use_dimred="PCA")
+plot_2D_generic(reducedDim(mat,"UMAP")[,1], reducedDim(mat,"UMAP")[,2], 
+                cols=c('lightskyblue1', 'royalblue4', 'coral', 'red4'),
+                cols_fac=factor(mat$Sample),
+                xlab='UMAP 1',
+                ylab='UMAP 2')
+
+
+```
+
+Let's color this by other factors just to see how the cells how QC metrics play into the cellular relationships.
+
+```{r}
+## color by size factor
+mat$Size_Factors <- sizeFactors(mat)
+plotTSNE(mat, colour_by="Size_Factors")
+
+## color by number of genes
+plotTSNE(mat, colour_by="log10_total_features_by_counts")
+
+## color by mitochondrial gene ratio
+plotTSNE(mat, colour_by="log10_mito_ratio")
+
+```
+
+
+## Clustering
+
+And we'll cluster by building a shared nearest neighbors graph from the retained PCs and finding community structure by cluster_louvain. Then we'll check the cluster modularity.
+
+```{r}
+
+snn.gr <- buildSNNGraph(mat, use.dimred="PCA")
+clusters <- igraph::cluster_louvain(snn.gr) 
+mat$Cluster <- factor(clusters$membership)
+table(mat$Cluster, mat$Sample)
+
+cluster.mod <- clusterModularity(snn.gr, mat$Cluster, get.values=TRUE)
+log.ratio <- log2(cluster.mod$observed/cluster.mod$expected + 1)
+
+library(pheatmap)
+pheatmap(log.ratio, cluster_rows=FALSE, cluster_cols=FALSE, 
+    color=colorRampPalette(c("white", "blue"))(100))
+
+```
+
+This looks reasonable.
+
+Finally, we'll blot the 2D data representations, coloring by cluster.
+
+```{r}
+
+plotTSNE(mat, colour_by="Cluster", shape_by="Sample") 
+
+plotPCA(mat, colour_by="Cluster", shape_by="Sample")
+
+plotUMAP(mat, colour_by="Cluster", shape_by="Sample")
+
+
+```
+
+
+## Digging into clusters
+
+Let's find out what markers define each of these clusters. We'll try looking at genes that specifically distinguish each cluster from the others. For each cluster, we'll identify all genes significantly (FDR < 0.05) up- or down-regulated compared to all other clusters. Where there are more than 15 such genes, we'll take only the 15 with the greatest average logFC.  We'll both print these genes for examination and make a heatmap of the conglomerate.
+
+```{r}
+markers <- findMarkers(mat, clusters=mat$Cluster, block=mat$Sample, direction='up', lfc=0, pval.type='all')
+
+marker.list <- vector('character', 0)
+
+for(i in 1:length(levels(mat$Cluster))){
+  marker.set <- markers[[as.character(i)]]
+  fdat <- rowData(mat)
+  marker.set$genes <- fdat[rownames(marker.set), 'Symbol']
+  print(paste('Cluster', as.character(i)))
+  print(length(which(marker.set$FDR <= 0.05)))
+  if(length(which(marker.set$FDR <= 0.05)) > 15){
+    marker.set <- marker.set[marker.set$FDR <= 0.05,]
+    avg_logfc <- apply(data.frame(marker.set[,3:8]), 1, mean)
+    print(head(marker.set[order(avg_logfc, decreasing=TRUE),], 15))
+    marker.list <- c(marker.list, marker.set$genes[order(avg_logfc, decreasing=TRUE)][1:15])
+  }else{
+    print(marker.set[which(marker.set$FDR <= 0.05),])
+    marker.list <- c(marker.list, marker.set$genes[marker.set$FDR < 0.05])
+  }
+}
+
+markers <- findMarkers(mat, clusters=mat$Cluster, block=mat$Sample, direction='down', lfc=0, pval.type='all')
+
+
+for(i in 1:length(levels(mat$Cluster))){
+  marker.set <- markers[[as.character(i)]]
+  fdat <- rowData(mat)
+  marker.set$genes <- fdat[rownames(marker.set), 'Symbol']
+  print(paste('Cluster', as.character(i)))
+  print(length(which(marker.set$FDR <= 0.05)))
+ if(length(which(marker.set$FDR <= 0.05)) > 15){
+    marker.set <- marker.set[marker.set$FDR <= 0.05,]
+    avg_logfc <- apply(data.frame(marker.set[,3:8]), 1, mean)
+    print(head(marker.set[order(avg_logfc, decreasing=FALSE),]))
+    marker.list <- c(marker.list, marker.set$genes[order(avg_logfc, decreasing=FALSE)][1:15])
+  }else{
+    print(marker.set[which(marker.set$FDR <= 0.05),])
+    marker.list <- c(marker.list, marker.set$genes[marker.set$FDR < 0.05])
+  }
+}
+
+marker.list
+marker.list <- marker.list[!duplicated(marker.list)]
+
+matord <- mat[,order(mat$Cluster)]
+
+phdf <- data.frame(colData(matord)[,c('Sample', 'Cluster')])
+phdf$Cluster <- paste0('Cluster', phdf$Cluster)
+levels(factor(phdf$Sample))
+
+levels(factor(phdf$Cluster))
+
+phcols <- list(Sample=c(SIGAC9='grey50', SIGAD9='grey50', SIGAE9='cornflowerblue', SIGAF9='cornflowerblue'), Cluster=c(Cluster1='pink1', Cluster2='mediumpurple1', Cluster3='steelblue', Cluster4='navyblue', Cluster5='coral2', Cluster6='violetred', Cluster7='palegreen4'))
+
+xx <- gene_heatmap(marker.list, matord, col_cat_df=phdf, col_cat_cols=phcols, clust_dist='correlation', cluster_cols=FALSE, color = viridis_pal()(100))
+png('tables_plots/cluster_markers_all.png', height=15, width=5, units = 'in', res=300)
+grid::grid.newpage()
+grid::grid.draw(xx$gtable)
+dev.off()
+
+```
+
+## Checking for doublets 
+
+We'll check for doublets running in simulation mode. This will give each cell a score that we can plot and check whether any clusters appear to obviously be doublets.
+
+```{r}
+set.seed(100)
+dbl.dens <- doubletCells(mat, BSPARAM=IrlbaParam())
+summary(dbl.dens)
+
+mat$DoubletScore <- dbl.dens
+plotTSNE(mat, colour_by="DoubletScore")
+plotPCA(mat, colour_by="DoubletScore")
+plotUMAP(mat, colour_by="DoubletScore")
+
+plotColData(mat, x="Cluster", y="DoubletScore", colour_by="Cluster")
+
+```
+
+There are very few cells that have high scores and they are spread across clusters. We won't consider any clusters to be doublets based on this analysis.
+
+
+## Save the object
+
+```{r}
+saveRDS(mat, file='data/NK_cells_QCfilt.rds')
+```
+
+And we'll save the session information to be thorough.
+
+```{r}
+sessionInfo()
+```

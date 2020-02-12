@@ -1,0 +1,185 @@
+---
+title: "NK cell IL-33 single cell experiment plots"
+author: "Arianne Richard"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script will make plots for the Halim Lab NK cell +/- IL33 scRNAseq data.
+
+First, load the appropriate packages and introduce the functions.
+
+```{r}
+library(scran)
+library(scater)
+library(SingleCellExperiment)
+source('NKcell_plotting_functions.R')
+```
+
+# Read in the data
+
+Load the data. We will use the single cell matrix that has been QC-filtered and undergone macrophage removal. We will also annotate the conditions for the different samples.
+
+```{r}
+mat <- readRDS(file='data/NK_cells_QCfilt_MPfilt.rds') 
+treatment <- mat$Sample
+treatment [treatment %in% c('SIGAC9', 'SIGAD9')] <- 'PBS'
+treatment [treatment %in% c('SIGAE9', 'SIGAF9')] <- 'IL33'
+treatment <- factor(treatment, levels=c('PBS', 'IL33'))
+mat$treatment <- treatment
+```
+
+# UMAP plots
+
+Make UMAP plots for figures.
+
+```{r}
+pdf('tables_plots/UMAP_treatment.pdf', height=5, width=5.5)
+par(mar=c(5,5,2,3))
+plot_2D_generic(reducedDim(mat,"UMAP")[,1], reducedDim(mat,"UMAP")[,2], 
+                cols=c('grey30', 'cornflowerblue'),
+                cols_fac=factor(mat$treatment),
+                xlab='UMAP1',
+                ylab='UMAP2', 
+                cex.lab=2, cex.axis=1.5, cex.legend=2)
+dev.off()
+
+pdf('tables_plots/UMAP_cluster.pdf', height=5, width=5.5)
+par(mar=c(5,5,2,3))
+plot_2D_generic(reducedDim(mat,"UMAP")[,1], reducedDim(mat,"UMAP")[,2], 
+                cols=c("pink1", "mediumpurple1", "steelblue", "navyblue", "coral2", "violetred", "palegreen4"),
+                cols_fac=factor(mat$Cluster),
+                xlab='UMAP1',
+                ylab='UMAP2', 
+                cex.lab=2, cex.axis=1.5, cex.legend=2)
+dev.off()
+```
+
+
+# Cluster distribution plots
+
+Make distribution pie charts. We'll first calculate the fraction of cells within each cluster from each sample and then take the average for PBS and IL-33-treated samples before making the pie chart.
+
+```{r}
+n_cells <- table(mat$Cluster, mat$Sample)
+
+n_cells_gg <- n_cells
+for(i in 1:ncol(n_cells_gg)){
+  n_cells_gg[,i] <- n_cells_gg[,i]/sum(n_cells_gg[,i])
+}
+
+n_cells_gg_avg <- data.frame(PBS=apply(n_cells_gg[,c(1:2)], 1, mean), 
+                             IL33=apply(n_cells_gg[,c(3:4)], 1, mean))
+pdf('tables_plots/Cluster_abundance_average_piecharts.pdf', height=3, width=3)
+par(mfrow=c(2,1), mar=c(0.5,0.5, 0.5, 0.5), cex=0.9)
+lapply(colnames(n_cells_gg_avg), function(x){
+  slices <- n_cells_gg_avg[,x]
+  lbls <- c(as.character(1:7))
+  pie(slices, lbls, 
+      clockwise = TRUE,
+      col=c("pink1", "mediumpurple1", "steelblue", "navyblue", 
+            "coral2", "violetred", "palegreen4"))
+  title(main=x, line=-0.4, cex.main=1.2, font.main=1)
+})
+dev.off()
+```
+
+And for a different representation, we'll also make bar charts showing both replicates from each condition.
+
+```{r}
+
+n_cells_gg <- data.frame(n_cells_gg)
+colnames(n_cells_gg) <- c('cluster', 'treatment', 'fraction')
+treatment <- as.character(n_cells_gg$treatment)
+treatment[treatment %in% c('SIGAC9', 'SIGAD9')] <- 'PBS'
+treatment[treatment %in% c('SIGAE9', 'SIGAF9')] <- 'IL33'
+n_cells_gg$treatment <- factor(treatment, levels=c('PBS', 'IL33'))
+
+pdf('tables_plots/Cluster_abundance_barchart.pdf', height=3, width=3)
+ggplot(n_cells_gg, aes(x=cluster, y=fraction, fill=cluster, shape=treatment)) +
+  geom_dotplot(binaxis='y', stackdir='center', 
+               position=position_dodge(0.7), binwidth=0.02, stroke=0) +
+  stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), 
+                 geom="pointrange", color="black", position=position_dodge(0.7), stroke=0.5) +
+  scale_fill_manual(values=c("pink1", "mediumpurple1", "steelblue", "navyblue", "coral2", "violetred", "palegreen4")) +
+  scale_color_manual(values=c("grey30", "cornflowerblue")) +
+  scale_shape_manual(values=c(1,3)) + 
+  theme_classic() +
+  coord_flip() +
+  guides(fill = FALSE)
+dev.off()
+
+
+```
+
+# DE Volcano plots 
+
+Volcano plots of DE analysis controlling for changes in cluster membership with interaction term. We'll also label the key functional molecules Gzmb and Ifng.
+
+```{r}
+
+DE3 <- read.table('tables_plots/GLMcontrolInteractionCluster_DE.txt')
+
+cols <- rep('black', times=nrow(DE3))
+cols[DE3$FDR < 0.05] <- 'red'
+cols[DE3$symbol == 'Ifng'] <- 'dodgerblue'
+cols[DE3$symbol == 'Gzmb'] <- 'red4'
+
+labs <- DE3[DE3$symbol %in% c('Ifng', 'Gzmb'),]
+
+ord <- c(c(1:nrow(DE3))[-which(DE3$symbol %in% c('Ifng', 'Gzmb'))], which(DE3$symbol %in% c('Ifng', 'Gzmb')))
+
+pdf('tables_plots/ControlClusterInteraction_DE_volcano_IFNg_GZMb.pdf', height=5, width=5)
+par(mar=c(4,5,1,1), bty='l', cex=1.5, mgp=c(2,0.5,0))
+plot(DE3$logFC[ord], -log10(DE3$PValue)[ord], col=cols[ord], pch=20,
+     ylab=expression('-log'[10]*'(p-value)'), xlab=expression('log'[2]*'(fold-change)'),
+     cex.axis=1, cex.lab=1.5)
+text(labs$logFC, -log10(labs$PValue), labels=labs$symbol, pos=2, offset=0.25, col='darkgrey', cex=1, font=4)
+dev.off()
+
+
+```
+
+# Specific gene and score plots
+
+We'll make violin plots of some key genes and cell cycle annotation.
+
+```{r}
+
+pdf('tables_plots/CD27_by_cluster.pdf', height=3.5, width=3.5)
+score_violin(exprs(mat)[rowData(mat)$Symbol == 'Cd27',], factor(mat$Cluster), 
+             break_factor_cols=c("pink1", "mediumpurple1", "steelblue", "navyblue", "coral2", "violetred", "palegreen4"),
+             score_name=expression('log'[2]*'(normalized '*italic('Cd27')* ' expression)'), break_factor_name="Cluster")
+dev.off()
+
+pdf('tables_plots/CD11b_by_cluster.pdf', height=3.5, width=3.5)
+score_violin(exprs(mat)[rowData(mat)$Symbol == 'Itgam',], factor(mat$Cluster), 
+             break_factor_cols=c("pink1", "mediumpurple1", "steelblue", "navyblue", "coral2", "violetred", "palegreen4"),
+             score_name=expression('log'[2]*'(normalized '*italic('Itgam')* ' expression)'), break_factor_name="Cluster")
+dev.off()
+
+pdf('tables_plots/Sphase_score_by_cluster.pdf', height=3.5, width=3.5)
+score_violin(mat$Seurat_Sscore, factor(mat$Cluster), 
+             break_factor_cols=c("pink1", "mediumpurple1", "steelblue", "navyblue", "coral2", "violetred", "palegreen4"),
+             score_name=expression('S-phase score'), break_factor_name="Cluster")
+dev.off()
+
+pdf('tables_plots/G2Mphase_score_by_cluster.pdf', height=3.5, width=3.5)
+score_violin(mat$Seurat_G2Mscore, factor(mat$Cluster), 
+             break_factor_cols=c("pink1", "mediumpurple1", "steelblue", "navyblue", "coral2", "violetred", "palegreen4"),
+             score_name=expression('G2M-phase score'), break_factor_name="Cluster")
+dev.off()
+
+
+```
+
+
+And we'll save the session information to be thorough.
+
+```{r}
+sessionInfo()
+```

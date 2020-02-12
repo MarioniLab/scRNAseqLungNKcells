@@ -1,0 +1,169 @@
+---
+title: "NK cell IL-33 single cell experiment DE and DA analyses by treatment"
+author: "Arianne Richard"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script will look at differential abundance of cells within each cluster with and without IL33 stimulation as well as differential expression within all NK cells with and without IL33 stimulation. 
+
+First, load the appropriate packages and introduce the functions.
+
+```{r}
+library(scran)
+library(scater)
+library(SingleCellExperiment)
+source('NKcell_plotting_functions.R')
+```
+
+## Read in the data
+
+Load the data. We will use the single cell matrix that has been QC-filtered and undergone macrophage removal. We will also annotate the conditions for the different samples.
+
+```{r}
+mat <- readRDS(file='data/NK_cells_QCfilt_MPfilt.rds') 
+treatment <- mat$Sample
+treatment [treatment %in% c('SIGAC9', 'SIGAD9')] <- 'PBS'
+treatment [treatment %in% c('SIGAE9', 'SIGAF9')] <- 'IL33'
+treatment <- factor(treatment, levels=c('PBS', 'IL33'))
+mat$treatment <- treatment
+```
+
+## Differential abundance testing among clusters
+
+First we want to test for differential abundances of cells from each condition within each cluster. We'll borrow some ideas from the cydar mass cytometry differential abundance analysis Bioconductor package and use the methods already implemented in edgeR for this. Of note, because there are very few clusters, we won't be estimating any dispersion trend.
+
+```{r}
+n_cells <- table(mat$Cluster, mat$Sample)
+n_cells
+
+apply(n_cells, 2, function(x){
+  slices <- x
+  lbls <- c(as.character(1:7))
+  pie(slices, lbls, 
+      clockwise = TRUE,
+      col=c('#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#46f0f0'))
+})
+
+## make a dataframe with sample-level annotation (instead of cell-level)
+samples_treatment <- data.frame(Sample=mat$Sample, treatment=mat$treatment)
+samples_treatment <- samples_treatment[!duplicated(samples_treatment),]
+rownames(samples_treatment) <- samples_treatment$Sample
+
+design <- model.matrix(~ 0 + samples_treatment$treatment)
+
+library(edgeR)
+y <- DGEList(counts = n_cells)
+y <- estimateDisp(y, design, trend.method = "none")
+fit <- glmQLFit(y, design, robust=TRUE, abundance.trend=FALSE)
+print(colnames(fit$coefficients))
+res <- glmQLFTest(fit, contrast=c(-1,1))
+top <- topTags(res, n=nrow(y))[[1]]
+
+top
+
+write.table(top, file='tables_plots/Cluster_DA.txt', quote=FALSE, sep='\t')
+```
+
+This shows that there is significant differential abundance in clusters 7, 5, 3, and 2 such that cells in 7 and 2 increase with IL-33 treatment while 5 and 3 decrease.
+
+
+## Pseudobulk differential expression analysis
+
+For this analysis, we'll only move forward with genes detected in at least 1% of cells to avoid any residual contamination if it exists in the dataset.
+
+```{r}
+
+frac_detected <- unlist(apply(counts(mat), 1, function(x){(length(which(x > 0)))/length(x)}))
+mat2 <- mat[frac_detected > 0.01,]
+
+dim(mat)
+dim(mat2)
+```
+
+Now we sum the data across individual cells per sample and perform DE analysis on pseudobulk populations.
+
+```{r}
+
+summed <- sumCountsAcrossCells(mat2, mat2$Sample)
+library(edgeR)
+y <- DGEList(summed)
+y <- calcNormFactors(y)
+
+design <- model.matrix(~0 + samples_treatment$treatment)
+y <- estimateDisp(y, design)
+plotBCV(y)
+
+fit <- glmQLFit(y, design, robust=TRUE)
+plotQLDisp(fit)
+summary(fit$df.prior)    
+
+print(colnames(fit$coefficients))
+res <- glmQLFTest(fit, contrast = c(-1,1))
+top <- topTags(res, n=nrow(y))[[1]]
+top$symbol <- rowData(mat2)[rownames(top), 'Symbol']
+head(top, 20)
+
+plot(top$logFC, -log10(top$PValue))
+
+write.table(top, file='tables_plots/Pseudobulk_DE.txt', quote=FALSE, sep='\t')
+```
+
+This gives us a sense of what is changing in the whole population of NK cells. However, because the proportions of cells in several clusters is also changing, these results may simply reflect the cluster shifts in abundance.
+
+## Differential expression analysis controlling for shifts in cluster membership proportions
+
+We're particularly interested in genes that change expression between PBS and IL33-treated conditions across all cells/clusters because the Halim lab have seen global suppression of NK cell function, not just changes in subsets of the population.
+
+To achieve this, we'll use the single-cell data in a differential expression test while controlling for cluster abundance. Because the cells from each mouse comprise a single treatment, we'll fit the model with mouse and cluster and then compare the average coefficient estimate for mice after IL-33 treatment with that of mice after PBS treatment.
+
+```{r}
+
+design <- model.matrix(~ 0 + Sample + Cluster, data=colData(mat2))
+colnames(design)
+y <- convertTo(mat2, type="edgeR")
+y <- estimateDisp(y, design)
+fit <- glmFit(y, design)
+print(colnames(fit$coefficients))
+resAll <- glmLRT(fit, contrast = c(-0.5, -0.5, 0.5, 0.5, 0, 0, 0, 0, 0, 0))
+topAll <- topTags(resAll, n=nrow(y))[[1]]
+topAll$symbol <- rowData(mat2)[rownames(topAll), 'Symbol']
+head(topAll, 50)
+hist(topAll$PValue)
+length(which(topAll$FDR < 0.05))
+
+write.table(topAll, file='tables_plots/GLMcontrolCluster_DE.txt', quote=FALSE, sep='\t')
+
+```
+
+This gave us a list assuming that there was no cluster-specific treatment effect. To allow and account for this, we need an interaction term.  Let's run that as well.
+
+```{r}
+
+design <- model.matrix(~ 0 + Sample + Cluster + Sample*Cluster, data=colData(mat2))
+y <- convertTo(mat2, type="edgeR")
+y <- estimateDisp(y, design)
+fit <- glmFit(y, design)
+print(colnames(fit$coefficients))
+resAll2 <- glmLRT(fit, contrast = c(-0.5, -0.5, 0.5, 0.5, rep(0, times=(ncol(design)-4))))
+topAll2 <- topTags(resAll2, n=nrow(y))[[1]]
+topAll2$symbol <- rowData(mat2)[rownames(topAll2), 'Symbol']
+head(topAll2, 50)
+hist(topAll2$PValue)
+length(which(topAll2$FDR < 0.05))
+
+write.table(topAll2, file='tables_plots/GLMcontrolInteractionCluster_DE.txt', quote=FALSE, sep='\t')
+
+```
+
+This is the full model we will use for the paper.
+
+And we'll save the session information to be thorough.
+
+```{r}
+sessionInfo()
+```
