@@ -156,11 +156,21 @@ score_violin(exprs(mat)[rowData(mat)$Symbol == 'Cd27',], factor(mat$Cluster),
              score_name=expression('log'[2]*'(normalized '*italic('Cd27')* ' expression)'), break_factor_name="Cluster")
 dev.off()
 
+Cd27_list <- split(exprs(mat)[rowData(mat)$Symbol == 'Cd27',], factor(mat$Cluster))
+print(paste0('Cluster ', levels(mat$Cluster), ' Cd27 median is ', lapply(Cd27_list, median), 
+             ', max is ', lapply(Cd27_list, max),
+             ', min is ', lapply(Cd27_list, min)))
+
 pdf('tables_plots/CD11b_by_cluster.pdf', height=3.5, width=3.5)
 score_violin(exprs(mat)[rowData(mat)$Symbol == 'Itgam',], factor(mat$Cluster), 
              break_factor_cols=c("pink1", "mediumpurple1", "steelblue", "navyblue", "coral2", "violetred", "palegreen4"),
              score_name=expression('log'[2]*'(normalized '*italic('Itgam')* ' expression)'), break_factor_name="Cluster")
 dev.off()
+
+Itgam_list <- split(exprs(mat)[rowData(mat)$Symbol == 'Itgam',], factor(mat$Cluster))
+print(paste0('Cluster ', levels(mat$Cluster), ' Itgam median is ', lapply(Itgam_list, median), 
+             ', max is ', lapply(Itgam_list, max),
+             ', min is ', lapply(Itgam_list, min)))
 
 pdf('tables_plots/Sphase_score_by_cluster.pdf', height=3.5, width=3.5)
 score_violin(mat$Seurat_Sscore, factor(mat$Cluster), 
@@ -168,12 +178,21 @@ score_violin(mat$Seurat_Sscore, factor(mat$Cluster),
              score_name=expression('S-phase score'), break_factor_name="Cluster")
 dev.off()
 
+Sphase_list <- split(mat$Seurat_Sscore, factor(mat$Cluster))
+print(paste0('Cluster ', levels(mat$Cluster), ' S-phase median is ', lapply(Sphase_list, median), 
+             ', max is ', lapply(Sphase_list, max),
+             ', min is ', lapply(Sphase_list, min)))
+
 pdf('tables_plots/G2Mphase_score_by_cluster.pdf', height=3.5, width=3.5)
 score_violin(mat$Seurat_G2Mscore, factor(mat$Cluster), 
              break_factor_cols=c("pink1", "mediumpurple1", "steelblue", "navyblue", "coral2", "violetred", "palegreen4"),
              score_name=expression('G2M-phase score'), break_factor_name="Cluster")
 dev.off()
 
+G2Mphase_list <- split(mat$Seurat_G2Mscore, factor(mat$Cluster))
+print(paste0('Cluster ', levels(mat$Cluster), ' G2M-phase median is ', lapply(G2Mphase_list, median), 
+             ', max is ', lapply(G2Mphase_list, max),
+             ', min is ', lapply(G2Mphase_list, min)))
 
 ```
 

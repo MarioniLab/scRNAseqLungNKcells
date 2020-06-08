@@ -127,8 +127,8 @@ gene_heatmap <- function(gene_vector, mat, col_cat_df=NA, col_cat_cols=NA, clust
 
 score_violin <- function(scores, break_factor, break_factor_cols, 
                          score_name="", break_factor_name=""){
-  ## generates a violin plot from pre-calculated module scores
-  ## score_colname = name of colData column containing the score of interest
+  ## generates a violin plot from pre-calculated module scores or gene expression
+  ## scores = scores or gene expression vector of interest
   ## break_factor = factor vector for splitting cells into groups 
   ## break_factor_cols = colors for the different factors
   ## score_name = y-axis label
